@@ -7,17 +7,19 @@ import math
 import os
 import queue
 import re
-import statistics
+import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from clifft_bench.calibration import CALIBRATION_POLICY
-from clifft_bench.config import Case, Suite
-from clifft_bench.schema import repository_root, validate_document, write_json
+from clifft_bench.config import Case, Suite, repository_root
+from clifft_bench.results import FORMAT, export_csv, write_json
 from clifft_bench.selection import has_postselection
 from clifft_bench.system import (
     choose_cpu,
@@ -144,11 +146,14 @@ class WorkerClient:
             timeout_seconds=timeout_seconds + 5,
         )
 
-    def close(self) -> None:
+    def close(self, *, interrupted: bool = False) -> None:
+        if interrupted:
+            self._stop()
+            return
         if self.process.poll() is None:
             try:
                 self.request({"command": "close"}, timeout_seconds=5)
-            except (BrokenPipeError, WorkerError, json.JSONDecodeError):
+            except (OSError, WorkerError, json.JSONDecodeError):
                 self._stop()
         try:
             self.process.wait(timeout=5)
@@ -171,6 +176,8 @@ def _workload_record(case: Case) -> dict[str, Any]:
         "id": definition["id"],
         "family": definition["family"],
         "parameters": definition["parameters"],
+        "expected_metadata": definition["expected_metadata"],
+        "compatible_adapters": definition["compatible_adapters"],
         "semantics": definition["semantics"],
         "artifact": {
             "path": str(case.workload.artifact_path),
@@ -180,7 +187,7 @@ def _workload_record(case: Case) -> dict[str, Any]:
     }
 
 
-def _simulator_record(case: Case) -> dict[str, Any]:
+def _simulator_record(case: Case, python_executable: str | None = None) -> dict[str, Any]:
     definition = case.implementation.definition
     record = {
         "implementation_id": definition["id"],
@@ -188,11 +195,9 @@ def _simulator_record(case: Case) -> dict[str, Any]:
         "version": definition["version"],
         "display_version": definition.get("display_version", definition["version"]),
         "commit_sha": definition["commit_sha"],
-        "commit_datetime": definition["commit_datetime"],
-        "release_datetime": definition["release_datetime"],
         "source_url": definition["source_url"],
         "adapter": definition["adapter"],
-        "python_executable": case.implementation.python_executable(),
+        "python_executable": python_executable or case.implementation.python_executable(),
         "build": definition["build"],
         "dependencies": {},
     }
@@ -205,8 +210,10 @@ def _new_case_result(
     case: Case,
     measurement: dict[str, Any],
     memory_limit_gib: float | None,
+    python_executable: str | None = None,
 ) -> dict[str, Any]:
     execution = dict(case.definition["execution"])
+    execution["batch_enabled"] = execution["batch_size"] != 1
     if execution["batch_size"] == "calibrate":
         execution["tuning_policy"] = CALIBRATION_POLICY
     execution.update(
@@ -229,29 +236,13 @@ def _new_case_result(
         "variant_id": case.definition["variant_id"],
         "status": "running",
         "workload": _workload_record(case),
-        "simulator": _simulator_record(case),
+        "simulator": _simulator_record(case, python_executable),
         "execution": execution,
         "setup": None,
         "warmup": None,
         "correctness": None,
         "samples": [],
-        "summary": None,
         "error": None,
-    }
-
-
-def _summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    rates = [float(sample["throughput_attempted_shots_per_second"]) for sample in samples]
-    median = statistics.median(rates)
-    deviations = [abs(rate - median) for rate in rates]
-    return {
-        "sample_count": len(samples),
-        "median_attempted_shots_per_second": median,
-        "mad_attempted_shots_per_second": statistics.median(deviations),
-        "min_attempted_shots_per_second": min(rates),
-        "max_attempted_shots_per_second": max(rates),
-        "total_attempted_shots": sum(int(sample["attempted_shots"]) for sample in samples),
-        "total_duration_seconds": sum(float(sample["duration_seconds"]) for sample in samples),
     }
 
 
@@ -285,7 +276,7 @@ def _select_cases(suite: Suite, pattern: str | None) -> list[Case]:
 def run_suite(
     suite: Suite,
     *,
-    output_path: Path,
+    output_dir: Path,
     case_pattern: str | None = None,
     cpu: int | None = None,
     memory_limit_gib: float | None = None,
@@ -294,8 +285,9 @@ def run_suite(
     python_executable: str | None = None,
     require_ec2: bool = False,
 ) -> dict[str, Any]:
-    if output_path.exists():
-        raise ValueError(f"refusing to overwrite existing result: {output_path}")
+    if output_dir.exists():
+        raise ValueError(f"refusing to overwrite existing execution: {output_dir}")
+    output_path = output_dir / "raw.json"
     if suite.run["classification"] == "official" and python_executable is not None:
         raise ValueError("official collection requires isolated implementation environments")
     measurement = dict(suite.run["measurement"])
@@ -365,28 +357,43 @@ def run_suite(
     started_at = utc_now()
     run_id = str(uuid.uuid4())
     document: dict[str, Any] = {
-        "schema_version": "clifft-bench/result/v1",
-        "suite_version": suite.run["suite_version"],
+        "format": FORMAT,
+        "campaign": {
+            **{k: deepcopy(v) for k, v in suite.run.items()
+               if k not in {"cases", "variants", "workloads_file", "software_file"}},
+            "cases": [deepcopy(case.definition) for case in cases],
+            "measurement": measurement,
+            "resources": {"logical_cpu": logical_cpu, "memory_limit_bytes": (
+                int(memory_limit_gib * (1 << 30)) if memory_limit_gib is not None else None
+            )},
+        },
         "run": {
             "id": run_id,
             "profile_id": suite.run["profile_id"],
             "classification": suite.run["classification"],
             "started_at": started_at,
             "finished_at": None,
-            "run_manifest": str(suite.run_path),
-            "workloads_manifest": str(suite.workloads_path),
-            "software_manifest": str(suite.software_path),
+            "overrides": {k: v for k, v in {
+                "cpu": cpu, "min_sample_seconds": min_sample_seconds,
+                "repetitions": repetitions, "python_executable": python_executable,
+            }.items() if v is not None},
             "selection": case_pattern,
-            "schedule_policy": "serial-manifest-order",
+            "schedule_policy": "serial-campaign-order",
             "workflow": ec2_workflow(root, cloud, run_id) if cloud else collect_workflow_metadata(),
         },
         "runner": collect_runner_metadata(root, cloud=cloud),
         "cases": [
-            _new_case_result(case, measurement, memory_limit_gib) for case in cases
+            _new_case_result(case, measurement, memory_limit_gib, python_executable)
+            for case in cases
         ],
     }
+    output_dir.mkdir(parents=True, exist_ok=False)
     write_json(output_path, document)
 
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, terminate)
     try:
         sequence_index = 0
         for case_index, (case, result) in enumerate(
@@ -504,26 +511,38 @@ def run_suite(
                     write_json(output_path, document)
 
                 if result["status"] == "running":
-                    result["summary"] = _summary(result["samples"])
                     result["status"] = "success"
                 write_json(output_path, document)
             finally:
                 if client is not None:
-                    client.close()
-    except KeyboardInterrupt:
+                    interrupted = sys.exception()
+                    try:
+                        client.close(interrupted=interrupted is not None)
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        if interrupted is None:
+                            raise
+                        interrupted.add_note(f"worker cleanup failed: {cleanup_error}")
+    except BaseException as error:
         for result in document["cases"]:
             if result["status"] == "running":
                 result["status"] = "interrupted"
                 result["error"] = {
-                    "phase": "sampling",
-                    "type": "KeyboardInterrupt",
-                    "message": "benchmark interrupted by user",
+                    "phase": next((phase for phase in ("setup", "warmup", "correctness")
+                                   if result[phase] is None), "sampling"),
+                    "type": type(error).__name__,
+                    "message": str(error) or "benchmark interrupted",
                 }
         raise
     finally:
-        document["run"]["finished_at"] = utc_now()
-        write_json(output_path, document)
-
-    validate_document(document, source=str(output_path))
-    write_json(output_path, document)
+        interrupted = sys.exception()
+        try:
+            document["run"]["finished_at"] = utc_now()
+            write_json(output_path, document)
+            export_csv(document, output_dir / "cases.csv")
+        except Exception as export_error:  # noqa: BLE001
+            if interrupted is None:
+                raise
+            interrupted.add_note(f"evidence finalization failed: {export_error}")
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     return document
