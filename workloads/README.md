@@ -31,10 +31,12 @@ The original eight QEC files are byte-for-byte copies from
 [`unitaryfoundation/clifft-paper`](https://github.com/unitaryfoundation/clifft-paper)
 commit `db7dc9f13a2c2854690e92390c779048a1ac1400`. The Quantum Volume
 files were generated from that commit with Qiskit 2.5.1 and seed 42, then given
-one observable per terminal measurement. Every measurement is a sampler output,
-so no adapter can reduce the workload to sampling a single marginal bit; the
-adapters still count observable-0 ones. The generated files are immutable inputs; Qiskit is not a runtime
-benchmark dependency. The applicable Apache-2.0 license is included as
+one observable per terminal measurement to expose the complete terminal readout.
+QV observable k is the measurement of qubit k. The benchmark still returns
+aggregate observable-0 counts; declaring these outputs does not require every
+adapter to materialize a full bitstring. The generated files are immutable inputs;
+Qiskit is not a runtime benchmark dependency. The applicable Apache-2.0 license
+is included as
 [`circuits/LICENSE-Clifft-paper`](circuits/LICENSE-Clifft-paper).
 
 The Draper adder was generated with
