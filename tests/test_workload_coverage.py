@@ -116,7 +116,7 @@ def qv_observable_probability(path: Path, qubits: int) -> float:
     state = np.zeros(1 << qubits, dtype=np.complex128)
     state[0] = 1
     indices = np.arange(len(state))
-    measurements = []
+    measurements, observables = [], []
     for line in path.read_text().splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
@@ -139,10 +139,13 @@ def qv_observable_probability(path: Path, qubits: int) -> float:
         elif line.startswith("M "):
             measurements.extend(map(int, line.split()[1:]))
         else:
-            assert line == "OBSERVABLE_INCLUDE(0) rec[-1]"
+            observables.append(line)
     assert len(measurements) == qubits
+    assert observables == [
+        f"OBSERVABLE_INCLUDE({k}) rec[-{qubits - k}]" for k in range(qubits)
+    ]
     assert float(np.vdot(state, state).real) == pytest.approx(1)
-    return float(np.sum(np.abs(state[(indices >> measurements[-1]) & 1 == 1])**2))
+    return float(np.sum(np.abs(state[(indices >> measurements[0]) & 1 == 1])**2))
 
 
 @pytest.mark.parametrize("adapter", ["clifft", "symft", "tsim"])
